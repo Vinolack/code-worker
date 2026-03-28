@@ -1,0 +1,25 @@
+# Python Cache
+__pycache__
+
+# Vitural Environments
+.venv
+venv
+.conda
+conda
+
+# Config file
+config/config.toml
+config/installed
+
+
+logs/*
+alembic/env.py
+alembic/script.py.mako
+
+alembic.ini
+
+#vscode
+.vscode
+
+config.toml
+AGENTS.md

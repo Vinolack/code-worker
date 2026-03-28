@@ -1,0 +1,58 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# @Desc: { 模块描述 }
+# @Date: 2023/02/12 22:09
+from src.base.enums.error import BaseErrCode, BaseErrCodeEnum
+
+
+class CommonException(Exception):
+    """通用异常"""
+
+    pass
+
+
+class BizException(CommonException):
+    """业务异常"""
+
+    def __init__(self, msg: str = "", code: str = BaseErrCodeEnum.FAILED.code, err_code: BaseErrCode = None):
+        self.code = code
+        self.msg = msg
+
+        if err_code:
+            self.code = err_code.code
+            self.msg = self.msg or err_code.msg
+
+
+class MaxRetryException(BizException):
+    """最大重试次数异常"""
+
+    def __init__(self, msg: str = BaseErrCodeEnum.FUNC_TIMEOUT_ERR.msg):
+        super().__init__(msg=msg, err_code=BaseErrCodeEnum.FUNC_RETRY_ERR)
+
+
+class MaxTimeoutException(BizException):
+    """最大超时异常"""
+
+    def __init__(self, msg: str = BaseErrCodeEnum.FUNC_TIMEOUT_ERR.msg):
+        super().__init__(msg=msg, err_code=BaseErrCodeEnum.FUNC_TIMEOUT_ERR)
+
+
+class SendMsgException(BizException):
+    """发送消息异常"""
+
+    pass
+
+class DuplicateRequestError(Exception):
+    """表示请求因幂等性检查而被拒绝的异常。"""
+    pass
+
+class HttpException(CommonException):
+    """HTTP请求异常，此处特指本服务端的接口请求异常，不包括请求上游服务的异常"""
+
+    def __init__(self, msg: str = "Internal Server Error", code: str = BaseErrCodeEnum.SYSTEM_ERR.code, err_code: BaseErrCode = None):
+        self.code = code
+        self.msg = msg
+
+        if err_code:
+            self.code = err_code.code
+            self.msg = self.msg or err_code.msg

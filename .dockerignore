@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# Python Cache
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+
+# Virtual Environments
+.venv
+venv
+.conda
+conda
+env/
+venv/
+ENV/
+
+# SQLite Database
+database.db
+
+# Docker
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker-compose.example.yml
+
+# CI/CD
+.gitlab-ci.yml
+
+# Config
+config.toml
+
+# Documentation and Tests
+tests/
+docs/
+README.md
+CLAUDE.md
+AGENTS.md
+*.md

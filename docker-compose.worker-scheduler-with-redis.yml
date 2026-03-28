@@ -1,0 +1,53 @@
+version: '3.9'
+services:
+  worker:
+    image: registry.gitlab.yeaosound.com/xaio-ai/xaio-code-worker:main
+    container_name: xaio-code-worker-web
+    restart: unless-stopped
+    command: ["python", "main.py", "worker"]
+    ports:
+      - "8084:8084"
+    volumes:
+      - ./logs/worker:/app/logs
+      - ./config.toml:/app/config.toml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+
+  scheduler:
+    image: registry.gitlab.yeaosound.com/xaio-ai/xaio-code-worker:main
+    container_name: xaio-code-worker-scheduler
+    restart: unless-stopped
+    command: ["python", "main.py", "scheduler"]
+    volumes:
+      - ./logs/scheduler:/app/logs
+      - ./config.toml:/app/config.toml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "scripts/check_scheduler_signal.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: xaio-code-worker-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  redis-data:

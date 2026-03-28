@@ -1,0 +1,250 @@
+stages:
+  - ai-review
+  - test
+  - build
+  - deploy
+
+include:
+  - project: 'public-contents/ci-cd-templates'  
+    file: 'templates/ai-review.yml'
+    ref: main
+
+# ===============================================
+# 公共配置
+# ===============================================
+# 自动部署脚本
+.deploy_script: &deploy_script
+  - |
+    echo "Logging into GitLab Container Registry..."
+    docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    echo "Pulling Docker image: $IMAGE_TO_DEPLOY"
+    docker pull "$IMAGE_TO_DEPLOY"
+    echo "Stopping and removing existing container: $CONTAINER_NAME"
+    if docker ps -a --filter "name=$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
+      docker stop "$CONTAINER_NAME" && docker rm "$CONTAINER_NAME"
+    fi
+
+    DOCKER_CMD="docker run -d -p \"$HOST_PORT\":\"$APP_PORT\" --name \"$CONTAINER_NAME\" --restart unless-stopped"
+    DOCKER_CMD="$DOCKER_CMD -v \"$LOGS_PATH\":/app/logs"
+
+    if [ "$MAP_CONFIG_FILE" = "true" ]; then
+      echo "Mapping config file: $CONFIG_PATH"
+      DOCKER_CMD="$DOCKER_CMD -v \"$CONFIG_PATH\":/app/config.toml"
+    else
+      echo "Skipping config file mapping."
+    fi
+
+    DOCKER_CMD="$DOCKER_CMD \"$IMAGE_TO_DEPLOY\""
+
+    echo "Executing Docker command..."
+    eval $DOCKER_CMD
+
+    echo "Cleaning up unused Docker images..."
+    docker image prune -f
+    echo "Deployment to $CI_ENVIRONMENT_NAME completed successfully!"
+
+# 手动部署专用脚本（简化版）
+.manual_deploy_script: &manual_deploy_script
+  - |
+    echo "=== STARTING MANUAL DEPLOYMENT ==="
+    echo "Target version: $MANUAL_VERSION_TAG"
+    docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    docker pull "$CI_REGISTRY_IMAGE:$MANUAL_VERSION_TAG"
+    if docker ps -a --filter "name=$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
+      docker stop "$CONTAINER_NAME" && docker rm "$CONTAINER_NAME"
+    fi
+    docker run -d \
+    -p "$HOST_PORT":"$APP_PORT" \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    ${MAP_CONFIG_FILE:+-v "$CONFIG_PATH":/app/config.toml} \
+    "$CI_REGISTRY_IMAGE:$MANUAL_VERSION_TAG"
+    echo "Manual deployment of $MANUAL_VERSION_TAG completed!"
+
+# 部署作业模板
+.deploy_template: &deploy_definition
+  stage: deploy
+  script: *deploy_script
+
+# 生产环境公共配置
+.production_config: &production_config
+  tags:
+    - xaio-worker-main-deploy-runner
+  variables:
+    CONTAINER_NAME: "xaio-code-worker-main"
+    MAP_CONFIG_FILE: "true"
+    GIT_STRATEGY: "none"
+  environment:
+    name: main
+
+limiter_regression_gate:
+  image: python:3.12-slim-trixie
+  stage: test
+  tags:
+    - docker
+  before_script:
+    - pip install --no-cache-dir --upgrade pip
+    - pip install --no-cache-dir -r requirements.txt
+  script:
+    - pytest -q tests/limiter
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "beta"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+build_image:
+  image: docker:cli
+  stage: build
+  services:
+    - name: docker:dind
+      command: ["--tls=false"]
+  tags:
+    - docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: 1
+    IMAGE_TAG: $CI_COMMIT_BRANCH
+    BUILDER_IMAGE: $CI_REGISTRY_IMAGE/builder
+  before_script:
+    - |
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+      if [ -z "$CI_COMMIT_BRANCH" ] && [ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]; then
+        IMAGE_TAG="main"
+      fi
+      # Calculate hash of requirements.txt
+      REQ_HASH=$(md5sum requirements.txt | cut -d' ' -f1)
+      BUILDER_TAG="deps-$REQ_HASH"
+      FULL_BUILDER_IMAGE="$BUILDER_IMAGE:$BUILDER_TAG"
+      echo "Requirements hash: $REQ_HASH"
+  script:
+    - |
+      echo "Checking for existing builder image: $FULL_BUILDER_IMAGE"
+      BUILDER_EXISTS=false
+      if docker pull "$FULL_BUILDER_IMAGE" 2>/dev/null; then
+        echo "Found existing builder image."
+        # Check if the builder is older than 14 days
+        # Parse date from 2026-01-21T10:26:22.042015297Z to 2026-01-21 10:26:22
+        CREATED_AT=$(docker inspect --format='{{.Created}}' "$FULL_BUILDER_IMAGE" | sed 's/T/ /' | cut -d. -f1)
+        CREATED_TS=$(date -d "$CREATED_AT" +%s)
+        NOW_TS=$(date +%s)
+        DIFF_DAYS=$(( (NOW_TS - CREATED_TS) / 86400 ))
+        echo "Builder age: $DIFF_DAYS days"
+        if [ $DIFF_DAYS -lt 14 ]; then
+          BUILDER_EXISTS=true
+          echo "Builder is valid (under 14 days)."
+        else
+          echo "Builder expired (14+ days), will rebuild."
+        fi
+      fi
+
+      if [ "$BUILDER_EXISTS" = "true" ]; then
+        echo "Building using cached deps stage..."
+        docker build --pull \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --build-arg WHEELS_IMAGE="$FULL_BUILDER_IMAGE" \
+          --cache-from "$FULL_BUILDER_IMAGE" \
+          -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG" .
+      else
+        echo "Building and pushing new deps stage..."
+        # Build deps_local stage
+        docker build --pull \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --target deps_local \
+          -t "$FULL_BUILDER_IMAGE" .
+        docker push "$FULL_BUILDER_IMAGE"
+
+        docker build --pull \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --build-arg WHEELS_IMAGE="$FULL_BUILDER_IMAGE" \
+          --cache-from "$FULL_BUILDER_IMAGE" \
+          -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG" .
+      fi
+
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        VERSION_TAG="v$(date -u +'%Y%m%d')"
+        echo "Main branch: tagging with $VERSION_TAG and latest"
+        docker tag $CI_REGISTRY_IMAGE:$IMAGE_TAG $CI_REGISTRY_IMAGE:$VERSION_TAG
+        docker tag $CI_REGISTRY_IMAGE:$IMAGE_TAG $CI_REGISTRY_IMAGE:latest
+        docker push $CI_REGISTRY_IMAGE:$VERSION_TAG
+        docker push $CI_REGISTRY_IMAGE:latest
+        echo $VERSION_TAG > version.txt
+      fi
+      docker push $CI_REGISTRY_IMAGE:$IMAGE_TAG
+  artifacts:
+    paths:
+      - version.txt
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "beta"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ===============================================
+# 自动部署阶段
+# ===============================================
+deploy_dev:
+  <<: *deploy_definition
+  needs: ["build_image"]
+  tags:
+    - ai_worker_auto_deploy_runner
+  variables:
+    CONTAINER_NAME: "xaio-code-worker-dev"
+    IMAGE_TO_DEPLOY: "$CI_REGISTRY_IMAGE:dev"
+  environment:
+    name: dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+      when: on_success
+
+deploy_beta:
+  <<: *deploy_definition
+  needs: ["build_image"]
+  tags:
+    - xaio-worker-beta-deploy-runner
+  variables:
+    CONTAINER_NAME: "xaio-code-worker-beta"
+    MAP_CONFIG_FILE: "true"
+    IMAGE_TO_DEPLOY: "$CI_REGISTRY_IMAGE:beta"
+  environment:
+    name: beta
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "beta"'
+      when: on_success
+
+deploy_production:
+  stage: deploy
+  script: *deploy_script
+  needs: 
+    - job: build_image
+      artifacts: true
+  <<: *production_config
+  before_script:
+    - |
+      if [ -f version.txt ]; then VERSION_TAG=$(cat version.txt); else VERSION_TAG="latest"; fi
+      export IMAGE_TO_DEPLOY="$CI_REGISTRY_IMAGE:$VERSION_TAG"
+      echo "Deploying production version: $VERSION_TAG"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"' 
+      when: on_success
+
+# ===============================================
+# 手动部署
+# ===============================================
+deploy_manual:
+  stage: deploy
+  <<: *production_config
+  script: *manual_deploy_script
+  needs: [] 
+  rules:
+    # 只有通过 Web 界面点击 "Run Pipeline" 或定时任务时才出现
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule"'
+      when: manual
+  # 提示用户需要输入变量
+  variables:
+    # 这里的变量可以在点击 Run Pipeline 时在 UI 界面覆盖
+    MANUAL_VERSION_TAG: "latest"
